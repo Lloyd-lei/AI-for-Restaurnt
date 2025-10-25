@@ -37,10 +37,20 @@ sudo apt-get install portaudio19-dev
 pip install -r requirements.txt
 ```
 
-### 2. 运行程序
+### 2. 配置 API Key
+
+在项目根目录创建 `.env` 文件，添加你的 OpenAI API Key：
 
 ```bash
-python3 realtime_client.py
+OPENAI_API_KEY=your-openai-api-key-here
+```
+
+⚠️ **重要**：请确保 `.env` 文件不会被提交到 Git（已在 `.gitignore` 中）
+
+### 3. 运行程序
+
+```bash
+python3 realtime_local_asr.py
 ```
 
 ## ⚙️ 配置参数

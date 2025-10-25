@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenAI Realtime 客户端 - 本地 Whisper ASR + OpenAI TTS
+OpenAI Realtime 客户端 - 端到端语音对话（支持 Function Calling）
 """
 
 import asyncio
@@ -13,8 +13,6 @@ import os
 from dotenv import load_dotenv
 import signal
 import sys
-import torch
-import whisper
 import time
 import base64
 from function_tools import FUNCTION_DEFINITIONS, execute_function
@@ -32,32 +30,23 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REALTIME_API_URL = "wss://api.openai.com/v1/realtime"
 MODEL = "gpt-4o-realtime-preview-2024-10-01"
 
-# 🔧 Whisper 模型选择接口
-WHISPER_MODEL = "base"  # 🎯 可选: tiny, base, small, medium, large
-# tiny   - 最快，准确率低
-# base   - 速度和准确率平衡
-# small  - 较准确（推荐）✅
-# medium - 很准确但慢
-# large  - 最准确但很慢
-
-# 音频参数
-SAMPLE_RATE = 16000  # Whisper 要求 16kHz
+# 音频参数（OpenAI Realtime API 要求）
+SAMPLE_RATE = 24000  # OpenAI 要求 24kHz
 CHANNELS = 1
 CHUNK_SIZE = 1024
 FORMAT = pyaudio.paInt16
 
-# VAD 参数（语音活动检测）
-ENERGY_THRESHOLD = 400  # 🎯 语音能量阈值（100-1000），越小越敏感
-SILENCE_DURATION = 1.0  # 🎯 静音多久后结束（秒），建议 0.8-2.0
-MIN_SPEECH_DURATION = 0.3  # 最小语音时长（秒）
+# 服务器端 VAD 参数（OpenAI 自动检测语音）
+VAD_THRESHOLD = 0.5  # 🎯 VAD 敏感度（0.0-1.0），越小越敏感
+VAD_PREFIX_PADDING_MS = 300  # 语音前填充（毫秒）
+VAD_SILENCE_DURATION_MS = 500  # 🎯 静音多久后结束（毫秒），建议 200-1000
 
 # TTS 参数
 TTS_VOICE = "shimmer"  # 🎯 可选: alloy, echo, fable, onyx, nova, shimmer
-PLAYBACK_SPEED = 1.1  # 🎯 播放速度（1.0 = 正常，1.2 = 1.2倍速）
 
 # ============================================================
 
-class RealtimeLocalASR:
+class RealtimeClient:
     def __init__(self):
         self.ws = None
         self.audio = pyaudio.PyAudio()
@@ -67,36 +56,9 @@ class RealtimeLocalASR:
         self.is_ai_speaking = False
         self.session_id = None
         
-        # Whisper
-        self.whisper_model = None
-        self.device = "cpu"
-        
-        # VAD
-        self.speech_buffer = []
-        self.is_speaking = False
-        self.silence_start = None
-        
         # 打断控制
         self.interrupt_flag = False
         self.drop_audio_until_cancelled = False  # 丢弃音频帧标志
-        
-    def load_whisper(self):
-        """加载 Whisper 模型"""
-        print(f"🔄 正在加载 Whisper 模型: {WHISPER_MODEL}")
-        start_time = time.time()
-        
-        self.whisper_model = whisper.load_model(WHISPER_MODEL, device=self.device)
-        
-        load_time = time.time() - start_time
-        print(f"✅ Whisper 模型加载完成（耗时: {load_time:.2f}秒）")
-        
-    def calculate_energy(self, audio_data):
-        """计算音频能量"""
-        audio_array = np.frombuffer(audio_data, dtype=np.int16)
-        if len(audio_array) == 0:
-            return 0
-        energy = np.mean(audio_array.astype(np.float32) ** 2)
-        return np.sqrt(energy) if energy > 0 else 0
     
     async def connect(self):
         """连接到 OpenAI Realtime API"""
@@ -129,17 +91,26 @@ class RealtimeLocalASR:
                     "回复风格：简洁、自然、友好。使用 function calling 来处理具体查询。"
                 ),
                 "voice": TTS_VOICE,
+                "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": None,  # 关闭服务器端 VAD，使用本地 VAD
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+                },
+                "turn_detection": {  # 🎯 启用服务器端 VAD（自动检测说话）
+                    "type": "server_vad",
+                    "threshold": VAD_THRESHOLD,
+                    "prefix_padding_ms": VAD_PREFIX_PADDING_MS,
+                    "silence_duration_ms": VAD_SILENCE_DURATION_MS
+                },
                 "tools": FUNCTION_DEFINITIONS  # 🎯 添加 function calling
             }
         }
         
         await self.ws.send(json.dumps(config))
-        print(f"⚙️  会话配置已发送（TTS: {TTS_VOICE}，Functions: {len(FUNCTION_DEFINITIONS)}个）")
+        print(f"⚙️  会话配置已发送（TTS: {TTS_VOICE}，Server VAD 已启用，Functions: {len(FUNCTION_DEFINITIONS)}个）")
         
     async def start_audio_input(self):
-        """启动麦克风输入"""
+        """启动麦克风输入并流式发送到 OpenAI"""
         self.input_stream = self.audio.open(
             format=FORMAT,
             channels=CHANNELS,
@@ -148,7 +119,7 @@ class RealtimeLocalASR:
             frames_per_buffer=CHUNK_SIZE
         )
         
-        print("🎙️  麦克风已启动，开始监听...")
+        print("🎙️  麦克风已启动，直接流式传输到 OpenAI（Server VAD 自动检测）...")
         
         while self.is_running:
             try:
@@ -157,32 +128,17 @@ class RealtimeLocalASR:
                     self.input_stream.read, CHUNK_SIZE, False
                 )
                 
-                # 只在 AI 不说话时处理用户输入
+                # 🎯 直接发送音频流到 OpenAI（不做本地处理）
                 if not self.is_ai_speaking:
-                    energy = self.calculate_energy(audio_data)
+                    # Base64 编码
+                    audio_b64 = base64.b64encode(audio_data).decode('utf-8')
                     
-                    # VAD: 检测语音活动
-                    if energy > ENERGY_THRESHOLD:
-                        if not self.is_speaking:
-                            print("🗣️  检测到语音...")
-                            self.is_speaking = True
-                        
-                        self.speech_buffer.append(audio_data)
-                        self.silence_start = None
-                    else:
-                        if self.is_speaking:
-                            if self.silence_start is None:
-                                self.silence_start = time.time()
-                            elif time.time() - self.silence_start > SILENCE_DURATION:
-                                # 静音足够长，识别语音
-                                print("🔇 语音结束，开始识别...")
-                                await self._process_speech()
-                                self.speech_buffer = []
-                                self.is_speaking = False
-                                self.silence_start = None
-                        else:
-                            # 收集背景音（用于更准确的 VAD）
-                            self.speech_buffer.append(audio_data)
+                    # 发送音频帧
+                    audio_msg = {
+                        "type": "input_audio_buffer.append",
+                        "audio": audio_b64
+                    }
+                    await self.ws.send(json.dumps(audio_msg))
                 
                 await asyncio.sleep(0.001)
                 
@@ -190,73 +146,6 @@ class RealtimeLocalASR:
                 if self.is_running:
                     print(f"❌ 音频输入错误: {e}")
                 break
-                
-    async def _process_speech(self):
-        """处理并识别语音"""
-        if len(self.speech_buffer) < int(SAMPLE_RATE * MIN_SPEECH_DURATION / CHUNK_SIZE):
-            print("⚠️  语音太短，跳过")
-            return
-        
-        # 合并音频
-        audio_data = b''.join(self.speech_buffer)
-        audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-        
-        print("🔍 正在识别...")
-        recognize_start = time.time()
-        
-        try:
-            # Whisper 识别
-            result = await asyncio.to_thread(
-                self.whisper_model.transcribe,
-                audio_array,
-                language=None,  # 自动检测语言
-                fp16=False,
-                verbose=False
-            )
-            
-            recognize_time = time.time() - recognize_start
-            text = result["text"].strip()
-            language = result["language"]
-            
-            if text:
-                print(f"📝 你说: {text} [{language}] (耗时: {recognize_time:.2f}秒)")
-                # 发送文本给 OpenAI
-                await self._send_text_to_openai(text)
-            else:
-                print("⚠️  未识别到内容")
-            
-        except Exception as e:
-            print(f"❌ 识别错误: {e}")
-    
-    async def _send_text_to_openai(self, text):
-        """发送文本给 OpenAI 并请求音频回复"""
-        # 重置音频丢弃标志，准备接收新的响应
-        self.drop_audio_until_cancelled = False
-        
-        # 创建对话项
-        message = {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": text
-                    }
-                ]
-            }
-        }
-        await self.ws.send(json.dumps(message))
-        
-        # 请求响应
-        response_msg = {
-            "type": "response.create",
-            "response": {
-                "modalities": ["audio", "text"]
-            }
-        }
-        await self.ws.send(json.dumps(response_msg))
     
     async def _send_function_result(self, call_id, result):
         """发送函数执行结果给 OpenAI"""
@@ -281,20 +170,15 @@ class RealtimeLocalASR:
         
     async def start_audio_output(self):
         """启动音频输出"""
-        playback_rate = int(24000 * PLAYBACK_SPEED)  # OpenAI 输出是 24kHz
-        
         self.output_stream = self.audio.open(
             format=FORMAT,
             channels=CHANNELS,
-            rate=playback_rate,
+            rate=SAMPLE_RATE,  # 24kHz
             output=True,
             frames_per_buffer=4800
         )
         
-        if PLAYBACK_SPEED != 1.0:
-            print(f"🔊 音频输出已启动（{PLAYBACK_SPEED}x 倍速）")
-        else:
-            print("🔊 音频输出已启动")
+        print("🔊 音频输出已启动（24kHz）")
     
     async def keyboard_listener(self):
         """监听键盘输入（按回车打断）"""
@@ -327,11 +211,10 @@ class RealtimeLocalASR:
                         self.output_stream.close()
                         
                         # 重新创建音频流（彻底清空缓冲区）
-                        playback_rate = int(24000 * PLAYBACK_SPEED)
                         self.output_stream = self.audio.open(
                             format=FORMAT,
                             channels=CHANNELS,
-                            rate=playback_rate,
+                            rate=SAMPLE_RATE,
                             output=True,
                             frames_per_buffer=4800
                         )
@@ -369,6 +252,22 @@ class RealtimeLocalASR:
                 
                 elif event_type == "session.updated":
                     print("✅ 会话配置已更新")
+                
+                # 🎯 语音检测事件（Server VAD）
+                elif event_type == "input_audio_buffer.speech_started":
+                    print("🗣️  检测到语音输入...")
+                
+                elif event_type == "input_audio_buffer.speech_stopped":
+                    print("🔇 语音输入结束，OpenAI 正在识别...")
+                
+                elif event_type == "conversation.item.input_audio_transcription.completed":
+                    # OpenAI 识别完成
+                    transcript = data.get("transcript", "")
+                    if transcript:
+                        print(f"📝 你说: {transcript}")
+                
+                elif event_type == "input_audio_buffer.committed":
+                    print("✅ 音频已提交，等待 AI 回复...")
                 
                 elif event_type == "response.created":
                     print("🤖 AI 开始生成回复...")
@@ -467,9 +366,6 @@ class RealtimeLocalASR:
     async def run(self):
         """运行客户端"""
         try:
-            # 加载 Whisper
-            self.load_whisper()
-            
             # 连接服务器
             await self.connect()
             
@@ -479,21 +375,22 @@ class RealtimeLocalASR:
             self.is_running = True
             
             print("\n" + "="*60)
-            print("🎉 Realtime 客户端已启动（本地 ASR + Function Calling）")
-            print(f"🎙️  本地 ASR: Whisper {WHISPER_MODEL.upper()}")
-            print(f"🗣️  OpenAI TTS: {TTS_VOICE}")
-            print(f"🎚️  VAD 阈值: {ENERGY_THRESHOLD}")
-            print(f"⏱️  静音时长: {SILENCE_DURATION}秒")
-            print("🌍 多语言自动识别")
+            print("🎉 OpenAI Realtime 客户端已启动（端到端语音对话）")
+            print(f"🤖 模型: {MODEL}")
+            print(f"🗣️  TTS 语音: {TTS_VOICE}")
+            print(f"🎙️  Server VAD 已启用（自动检测语音）")
+            print(f"   - VAD 阈值: {VAD_THRESHOLD}")
+            print(f"   - 静音检测: {VAD_SILENCE_DURATION_MS}ms")
+            print("🌍 多语言自动识别（OpenAI Whisper）")
             print("\n🔧 可用功能:")
             print("  📍 查天气 - 问「北京今天天气怎么样？」")
             print("  🍜 查菜单 - 问「有什么推荐的菜？」「有不辣的菜吗？」")
             print("  📚 搜书籍 - 问「推荐科幻小说」「刘慈欣的书」")
             print("  👋 结束对话 - 说「再见」「拜拜」")
             print("\n💡 操作提示:")
-            print("  🎤 说话后停顿即可自动识别")
-            print("  ⚡ 按回车键可以取消 AI 响应（停止 LLM+TTS 生成）")
-            print("  🛑 按 Ctrl+C 强制退出")
+            print("  🎤 直接说话，OpenAI 自动检测和识别（无需等待）")
+            print("  ⚡ 按回车键可以打断 AI 说话")
+            print("  🛑 按 Ctrl+C 退出")
             print("="*60 + "\n")
             
             # 运行（添加键盘监听）
@@ -541,16 +438,16 @@ async def main():
     """主函数"""
     if not OPENAI_API_KEY:
         print("❌ 错误: 未找到 OPENAI_API_KEY")
-        print("请在 .env 文件中设置你的 API Key")
+        print("请在 .env 文件中设置你的 API Key，或者在代码中直接配置")
         return
     
-    print("🚀 OpenAI Realtime 客户端（本地 Whisper ASR）")
-    print(f"📦 使用模型: Whisper {WHISPER_MODEL}")
+    print("🚀 OpenAI Realtime 客户端（端到端语音对话）")
+    print(f"📦 使用模型: {MODEL}")
     print("")
     
     signal.signal(signal.SIGINT, signal_handler)
     
-    client = RealtimeLocalASR()
+    client = RealtimeClient()
     await client.run()
 
 if __name__ == "__main__":
