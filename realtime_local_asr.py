@@ -241,6 +241,8 @@ class RealtimeClient:
         
     async def handle_messages(self):
         """处理来自服务器的消息"""
+        current_text = ""  # 用于累积 AI 文本回复
+        
         try:
             async for message in self.ws:
                 data = json.loads(message)
@@ -255,40 +257,90 @@ class RealtimeClient:
                 
                 # 🎯 语音检测事件（Server VAD）
                 elif event_type == "input_audio_buffer.speech_started":
-                    print("🗣️  检测到语音输入...")
+                    print("\n🗣️  检测到语音输入...")
                 
                 elif event_type == "input_audio_buffer.speech_stopped":
                     print("🔇 语音输入结束，OpenAI 正在识别...")
                 
+                # 🎯 ASR 转录结果（关键修复：正确的事件类型）
                 elif event_type == "conversation.item.input_audio_transcription.completed":
-                    # OpenAI 识别完成
                     transcript = data.get("transcript", "")
                     if transcript:
                         print(f"📝 你说: {transcript}")
+                
+                elif event_type == "conversation.item.created":
+                    # 新对话项创建（可能包含转录）
+                    item = data.get("item", {})
+                    if item.get("type") == "message" and item.get("role") == "user":
+                        content = item.get("content", [])
+                        for c in content:
+                            if c.get("type") == "input_audio":
+                                transcript = c.get("transcript", "")
+                                if transcript:
+                                    print(f"📝 你说: {transcript}")
                 
                 elif event_type == "input_audio_buffer.committed":
                     print("✅ 音频已提交，等待 AI 回复...")
                 
                 elif event_type == "response.created":
-                    print("🤖 AI 开始生成回复...")
+                    print("\n🤖 AI 开始生成回复...")
+                    current_text = ""  # 重置文本缓存
+                
+                elif event_type == "response.output_item.added":
+                    # 输出项添加（可能是文本或音频）
+                    output_item = data.get("item", {})
+                    item_type = output_item.get("type", "")
+                    if item_type == "function_call":
+                        print(f"🔧 准备调用函数...")
                 
                 elif event_type == "response.done":
+                    # 🎯 在这里显示完整的文本（如果有）
+                    response = data.get("response", {})
+                    output = response.get("output", [])
+                    
+                    # 提取所有文本内容
+                    all_texts = []
+                    for item in output:
+                        if item.get("type") == "message":
+                            content = item.get("content", [])
+                            for c in content:
+                                if c.get("type") == "text":
+                                    text = c.get("text", "")
+                                    if text:
+                                        all_texts.append(text)
+                    
+                    if all_texts:
+                        full_text = "".join(all_texts)
+                        print(f"\n💬 AI 说: {full_text}")
+                    
                     print("✅ AI 回复完成\n")
                     self.is_ai_speaking = False
                 
                 elif event_type == "response.text.delta":
                     delta = data.get("delta", "")
+                    current_text += delta
                     print(delta, end="", flush=True)
                 
                 elif event_type == "response.text.done":
                     text = data.get("text", "")
-                    if text:
-                        print(f"\n💬 AI: {text}")
+                    if text and text != current_text:
+                        print(f"\n💬 AI 说: {text}")
+                
+                elif event_type == "response.audio_transcript.delta":
+                    # 🎯 音频转录增量（实时显示 AI 说的话）
+                    delta = data.get("delta", "")
+                    if delta:
+                        print(delta, end="", flush=True)
+                
+                elif event_type == "response.audio_transcript.done":
+                    # 🎯 音频转录完成
+                    transcript = data.get("transcript", "")
+                    if transcript:
+                        print(f"\n💬 AI 说: {transcript}")
                 
                 elif event_type == "response.audio.delta":
-                    # 🎯 如果正在等待取消确认，丢弃所有音频帧
+                    # 🎯 播放音频流（关键修复）
                     if self.drop_audio_until_cancelled:
-                        # 静默丢弃，不播放
                         continue
                     
                     self.is_ai_speaking = True
@@ -298,63 +350,69 @@ class RealtimeClient:
                         try:
                             self.output_stream.write(audio_data)
                         except Exception as e:
-                            # 可能在重置流时出错，忽略
-                            pass
+                            print(f"⚠️  音频播放错误: {e}")
                 
                 elif event_type == "response.audio.done":
-                    print("🔊 AI 语音播放完成")
+                    if not self.drop_audio_until_cancelled:
+                        print("🔊 AI 语音播放完成")
                     self.is_ai_speaking = False
                 
-                # 🎯 Function call 相关事件
+                # 🎯 Function call 相关事件（增强显示）
                 elif event_type == "response.function_call_arguments.delta":
-                    # Function 参数增量（可选：显示参数构建过程）
-                    pass
+                    # 显示参数构建过程
+                    delta = data.get("delta", "")
+                    if delta:
+                        print(delta, end="", flush=True)
                 
                 elif event_type == "response.function_call_arguments.done":
-                    # Function 参数接收完成
                     call_id = data.get("call_id")
                     function_name = data.get("name")
                     arguments_str = data.get("arguments", "{}")
                     
-                    print(f"\n🔧 调用函数: {function_name}")
+                    print(f"\n\n{'='*60}")
+                    print(f"🔧 Function Call 开始")
+                    print(f"{'='*60}")
+                    print(f"📌 函数名: {function_name}")
                     print(f"📋 参数: {arguments_str}")
                     
-                    # 执行函数
                     try:
                         arguments = json.loads(arguments_str)
+                        print(f"⏳ 正在执行...")
+                        
                         result = execute_function(function_name, arguments)
                         
-                        print(f"✅ 函数结果: {json.dumps(result, ensure_ascii=False, indent=2)}")
+                        print(f"✅ 执行成功")
+                        print(f"📦 返回结果:")
+                        print(json.dumps(result, ensure_ascii=False, indent=2))
+                        print(f"{'='*60}\n")
                         
                         # 🎯 特殊处理：end_conversation
                         if function_name == "end_conversation":
-                            print("\n👋 用户选择结束对话")
-                            # 先发送函数结果，然后退出
+                            print("👋 用户选择结束对话")
                             await self._send_function_result(call_id, result)
-                            await asyncio.sleep(2)  # 等待 AI 说完再见
+                            await asyncio.sleep(3)
                             self.is_running = False
                             return
                         
-                        # 发送函数结果给 OpenAI
                         await self._send_function_result(call_id, result)
                         
                     except Exception as e:
                         print(f"❌ 函数执行失败: {e}")
+                        print(f"{'='*60}\n")
                         error_result = {"error": str(e)}
                         await self._send_function_result(call_id, error_result)
                 
                 # 🎯 响应被取消（打断）
                 elif event_type == "response.cancelled":
-                    print("✅ 服务器确认：响应已取消")
+                    print("\n✅ 服务器确认：响应已取消")
                     self.is_ai_speaking = False
-                    self.drop_audio_until_cancelled = False  # 重置丢弃标志
+                    self.drop_audio_until_cancelled = False
                 
                 elif event_type == "error":
                     error = data.get("error", {})
                     error_msg = error.get('message', '未知错误')
-                    print(f"❌ 错误: {error_msg}")
+                    print(f"\n❌ 错误: {error_msg}")
                     
-                    # 如果是取消失败错误，重置音频丢弃标志
                     if "Cancellation failed" in error_msg or "no active response" in error_msg:
                         self.drop_audio_until_cancelled = False
                 
